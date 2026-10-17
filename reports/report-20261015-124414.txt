@@ -1,0 +1,21 @@
+Обработка завершена.
+Политика: strict
+Включённые политики: strict, personal-data, credentials, network-data
+Начало: 2026-10-15 12:44:14
+Завершение: 2026-10-15 12:44:14
+Обработано файлов: 1
+Пропущено файлов: 0
+Создано замен: 13
+  правило people: 1
+  правило emails: 3
+  правило phones: 1
+  правило organizations: 1
+  правило other-values: 1
+  правило ips: 2
+  правило urls: 1
+  правило passwords: 1
+  правило keys: 2
+Конфликтов: 0
+Ошибок: 0
+Результат сохранён:
+G:\Desktop\FP\Lab\untitled\anonymized
