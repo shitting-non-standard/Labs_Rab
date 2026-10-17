@@ -7,8 +7,7 @@ import scala.collection.immutable.ListMap
 import scala.collection.mutable.ListBuffer
 
 // Singleton: в приложении один журнал, доступный отовсюду.
-// ВАЖНО: в журнал пишем только служебные сообщения: id правил, количество, относительные пути.
-// Найденные значения, фрагменты документов и ввод пользователя в журнал не попадают.
+
 object Log {
   private var file: Option[Path] = None
 
@@ -47,7 +46,7 @@ object Log {
     }
 }
 
-// Чтение и запись конфигурационного файла (JSON, см. Json.scala)
+// Чтение и запись конфигурационного файла
 object ConfigStore {
 
   // Читает и проверяет конфигурацию. При любой проблеме бросает ConfigException.
