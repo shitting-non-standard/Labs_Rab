@@ -1,4 +1,5 @@
-//> using scala 3.7.0
+//> using scala 3.10.0
+//> using dep tools.jackson.core:jackson-databind:3.2.1
 
 // ===== Менеджер политик анонимизации: консольный интерфейс =====
 // Запуск: scala-cli run . -- anonymizer.json  или  sbt run (см. build.sbt)
@@ -10,7 +11,8 @@ import scala.util.{Failure, Success, Try}
 
 object Main {
   def main(args: Array[String]): Unit = {
-    val configPath = Paths.get(args.headOption.getOrElse("anonymizer.json"))
+    val configPath = Paths.get(args.headOption.getOrElse("anonymizer.json")).toAbsolutePath
+    Workspace.baseDir = configPath.getParent // пути из конфигурации считаем от её папки
     val config =
       try {
         ConfigStore.loadValidated(configPath)
@@ -32,6 +34,7 @@ class App(configPath: Path, initialConfig: AppConfig) {
   private var selection: List[Path] = Nil        // пути, выбранные командой select
   private var selectionRecursive = false
   private var lastReport: Option[Report] = None
+  private var previewed: Option[String] = None  // для каких политики и файлов уже выполнялся preview
 
   // Разбор строки на слова; текст в кавычках считается одним словом (пути с пробелами)
   private val tokenRe = "\"([^\"]*)\"|(\\S+)".r
@@ -43,7 +46,8 @@ class App(configPath: Path, initialConfig: AppConfig) {
       rules: List[Rule],
       scan: Scan,
       outcomes: List[FileOutcome],
-      sources: String)
+      sources: String,
+      key: String)
 
   // ---------- Главный цикл ----------
 
@@ -101,11 +105,24 @@ class App(configPath: Path, initialConfig: AppConfig) {
     if (line == null) "" else line.trim
   }
 
-  private def confirm(question: String): Boolean =
-    ask(question + " (y/n): ").toLowerCase match {
-      case "y" | "yes" | "д" | "да" => true
-      case _ => false
+  // Переспрашивает, пока не получит понятный ответ. Если ввод закрыт — считаем отказом.
+  private def confirm(question: String): Boolean = {
+    var answer: Option[Boolean] = None
+    while (answer.isEmpty) {
+      val line = scala.io.StdIn.readLine(question + " (y/n): ")
+      if (line == null) {
+        println("Ввод закрыт, действие отменено.")
+        answer = Some(false)
+      } else {
+        line.trim.toLowerCase match {
+          case "y" | "yes" | "д" | "да" => answer = Some(true)
+          case "n" | "no" | "н" | "нет" => answer = Some(false)
+          case _ => println("Введите y или n.")
+        }
+      }
     }
+    answer.get
+  }
 
   private def argument(args: List[String], what: String): String =
     args.headOption.getOrElse(throw new ConfigException(s"Укажите $what"))
@@ -171,6 +188,7 @@ class App(configPath: Path, initialConfig: AppConfig) {
     } else {
       ConfigStore.save(configPath, updated) // при ошибке сохранения бросит исключение, config не изменится
       config = updated
+      previewed = None
       println(s"Политика '$name' сохранена.")
       Log.info(s"$action политики '$name'")
       reportOverrides(name)
@@ -265,6 +283,7 @@ class App(configPath: Path, initialConfig: AppConfig) {
       val updated = config.copy(policies = config.policies.removed(name))
       ConfigStore.save(configPath, updated)
       config = updated
+      previewed = None
       println("Политика удалена.")
       Log.info(s"Удаление политики '$name'")
     }
@@ -328,7 +347,8 @@ class App(configPath: Path, initialConfig: AppConfig) {
     val outcomes = Processor.analyzeAll(scan, rules)
     val matches = outcomes.flatMap(_.analysis).map(_.accepted.size).sum
     Log.info(s"Анализ завершён: файлов ${outcomes.size}, совпадений $matches")
-    Prepared(policy, resolved, rules, scan, outcomes, paths.mkString(", "))
+    Prepared(policy, resolved, rules, scan, outcomes, paths.mkString(", "),
+      s"$policy|${paths.mkString(",")}|$recursive")
   }
 
   private def label(r: RuleDef): String = if (r.description.nonEmpty) r.description else r.id
@@ -361,17 +381,17 @@ class App(configPath: Path, initialConfig: AppConfig) {
       files.zipWithIndex.foreach { case ((name, a, changes), i) =>
         println(s"  ${i + 1}. $name (замен: ${changes.size}, конфликтов: ${a.disputed.size})")
       }
-      var go = true
-      while (go) {
-        ask("Номер файла для подробностей (Enter — продолжить): ").toIntOption match {
-          case Some(n) if n >= 1 && n <= files.size =>
-            val (name, a, changes) = files(n - 1)
-            println(s"\nФайл: $name")
-            changes.foreach(c => println(s"Строка ${c.line}:\n${c.before}\n→ ${c.after}\n"))
-            a.disputed.foreach { c =>
-              println(s"Строка ${Engine.lineOf(a.text, c.hit.start)}: КОНФЛИКТ (правило ${c.rule.defn.id}), участок не изменяется без подтверждения\n")
-            }
-          case _ => go = false
+      // Один вопрос без повтора: можно ввести несколько номеров через пробел (например: 1 3) или "all".
+      val line = ask("Номер файла для подробностей (Enter — продолжить): ")
+      val chosen =
+        if (line.equalsIgnoreCase("all")) files.indices.toList
+        else line.split("[\\s,]+").toList.flatMap(t => t.toIntOption).filter(n => n >= 1 && n <= files.size).map(n => n - 1)
+      chosen.foreach { i =>
+        val (name, a, changes) = files(i)
+        println(s"\nФайл: $name")
+        changes.foreach(c => println(s"Строка ${c.line}:\n${c.before}\n→ ${c.after}\n"))
+        a.disputed.foreach { c =>
+          println(s"Строка ${Engine.lineOf(a.text, c.hit.start)}: КОНФЛИКТ (правило ${c.rule.defn.id}), участок не изменяется без подтверждения\n")
         }
       }
     }
@@ -381,18 +401,33 @@ class App(configPath: Path, initialConfig: AppConfig) {
     val p = prepare(args)
     printSummary(p)
     browseDetails(p)
+    previewed = Some(p.key)
   }
 
+  // anonymize работает и без предварительного preview, но тогда выводится предупреждение
   private def anonymize(args: List[String]): Unit = {
     val p = prepare(args)
-    printSummary(p)
-    browseDetails(p)
-    if (p.outcomes.forall(_.analysis.isEmpty)) {
+    val analyzed = p.outcomes.flatMap(_.analysis)
+    val matches = analyzed.map(_.accepted.size).sum
+    val conflicts = analyzed.map(_.disputed.size).sum
+
+    p.scan.skipped.foreach { case (name, why) => println(s"  пропущен $name: $why") }
+    p.outcomes.filter(_.error.isDefined).foreach { o =>
+      println(s"  ошибка ${o.source.relative}: ${o.error.getOrElse("")}")
+    }
+    println(s"Файлов к обработке: ${analyzed.size}, найдено совпадений: $matches, конфликтов: $conflicts")
+
+    if (!previewed.contains(p.key)) {
+      println("ВНИМАНИЕ: предпросмотр (preview) для этой политики и этих файлов не выполнялся.")
+      println("Вы не увидите, что именно будет заменено. Рекомендуется сначала выполнить: preview " + p.policy)
+      Log.warn("Запуск anonymize без предварительного preview")
+    }
+
+    if (analyzed.isEmpty) {
       println("Нет файлов для обработки.")
     } else if (!confirm(s"Создать копии в '${config.outputDirectory}'?")) {
       println("Отменено.")
     } else {
-      val conflicts = p.outcomes.flatMap(_.analysis).map(_.disputed.size).sum
       val withDisputed = conflicts > 0 && confirm(s"Конфликтов правил: $conflicts. Заменить спорные участки?")
       Log.info("Начало обработки")
       val report = Processor.writeCopies(p.policy, p.resolved, p.scan, p.outcomes, config, withDisputed)
@@ -407,7 +442,7 @@ class App(configPath: Path, initialConfig: AppConfig) {
 
   private def saveReport(r: Report): Unit = {
     val stamp = r.started.format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
-    val file = Paths.get(config.reportDirectory).resolve(s"report-$stamp.txt")
+    val file = Workspace.resolve(config.reportDirectory).resolve(s"report-$stamp.txt")
     try {
       Files.createDirectories(file.getParent)
       Files.writeString(file, r.toText)
@@ -431,6 +466,7 @@ class App(configPath: Path, initialConfig: AppConfig) {
     Try(ConfigStore.loadValidated(configPath)) match {
       case Success(newConfig) =>
         config = newConfig
+        previewed = None
         Log.init(config.logFile)
         println("Конфигурация перезагружена.")
         Log.info("Конфигурация перезагружена")
