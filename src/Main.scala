@@ -1,6 +1,3 @@
-//> using scala 3.10.0
-//> using dep tools.jackson.core:jackson-databind:3.2.1
-
 // ===== Менеджер политик анонимизации: консольный интерфейс =====
 // Запуск: scala-cli run . -- anonymizer.json  или  sbt run (см. build.sbt)
 //

@@ -54,6 +54,12 @@ enum BuiltinType(val key: String, val description: String, val regex: String) {
   case Token extends BuiltinType("token", "Токен или ключ доступа",
     """(?iuU)(?:\b((?:(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token|token|secret)[\x22\x27]?[ \t]*[=:][ \t]*[\x22\x27]?|Bearer[ \t]+))[A-Za-z0-9\-._~+/=]{6,}|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,})\b)""")
 
+  //Помогитеб.. утопаю в МАССАХ...
+  //ПОМОГИТЕ Б.. КТО-НИБУДЬ Б..
+  //МИХАИЛ... откройте скорее..б ...
+  //МАССЫ ТЕКУТ
+  //ТЕКЁТ
+
   // Выражение компилируется один раз, при первом обращении
   lazy val pattern: Pattern = Pattern.compile(regex)
 }
