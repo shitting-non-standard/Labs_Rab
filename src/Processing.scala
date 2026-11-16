@@ -1,13 +1,11 @@
 // ===== Обработка текста и файлов =====
+// Функции возвращают данные или Either[AppError, ...]. Вывода на экран и чтения ввода здесь нет.
 
 import java.nio.ByteBuffer
 import java.nio.charset.{CharacterCodingException, CodingErrorAction, StandardCharsets}
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path}
 import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
-import scala.util.{Failure, Success, Try}
 
 // Совпадение + правило, которое его нашло
 case class Candidate(rule: Rule, hit: Hit)
@@ -22,6 +20,9 @@ case class TextAnalysis(text: String, accepted: List[Candidate], disputed: List[
 
 object Engine {
 
+  // Состояние жадного выбора совпадений (неизменяемое)
+  private case class Pick(chosen: Vector[Candidate], disputed: Set[Candidate])
+
   // Шаг 1. Ищем ВСЕ совпадения в исходном тексте, до каких-либо замен.
   // Шаг 2. Выбираем победителей среди пересекающихся совпадений.
   def analyze(text: String, rules: List[Rule]): TextAnalysis = {
@@ -32,47 +33,47 @@ object Engine {
       (-c.rule.defn.priority, -(c.hit.end - c.hit.start), c.hit.start, c.rule.defn.id)
     }
 
-    val chosen = mutable.ListBuffer[Candidate]()
-    val disputed = mutable.Set[Candidate]()
-    for (c <- ordered) {
-      val clashes = chosen.filter(o => c.hit.start < o.hit.end && o.hit.start < c.hit.end)
+    val picked = ordered.foldLeft(Pick(Vector.empty, Set.empty)) { (pick, c) =>
+      val clashes = pick.chosen.filter(o => overlaps(c, o))
       if (clashes.isEmpty) {
-        chosen += c
+        pick.copy(chosen = pick.chosen :+ c)
       } else {
         // Проигравший отбрасывается. Но если у соперника тот же приоритет и та же длина,
         // победителя определить нельзя — участок помечается как конфликт.
-        clashes.filter(o => samePower(o, c)).foreach(o => disputed += o)
+        pick.copy(disputed = pick.disputed ++ clashes.filter(o => samePower(o, c)))
       }
     }
 
     TextAnalysis(
       text,
-      chosen.filterNot(c => disputed.contains(c)).sortBy(_.hit.start).toList,
-      chosen.filter(c => disputed.contains(c)).sortBy(_.hit.start).toList)
+      picked.chosen.filterNot(c => picked.disputed.contains(c)).sortBy(_.hit.start).toList,
+      picked.chosen.filter(c => picked.disputed.contains(c)).sortBy(_.hit.start).toList)
   }
+
+  private def overlaps(a: Candidate, b: Candidate): Boolean =
+    a.hit.start < b.hit.end && b.hit.start < a.hit.end
 
   private def samePower(a: Candidate, b: Candidate): Boolean =
     a.rule.defn.priority == b.rule.defn.priority &&
       (a.hit.end - a.hit.start) == (b.hit.end - b.hit.start)
 
+  // Состояние при сборке нового текста
+  private case class Built(pos: Int, line: Int, parts: Vector[String], changes: Vector[Change])
+
   // Шаг 3. Выполняем замены. withDisputed = true — заменить и спорные участки.
   def render(a: TextAnalysis, withDisputed: Boolean, book: PseudonymBook): (String, List[Change]) = {
     val used = (if (withDisputed) a.accepted ++ a.disputed else a.accepted).sortBy(_.hit.start)
-    val out = new StringBuilder
-    val changes = mutable.ListBuffer[Change]()
-    var pos = 0
-    var line = 1
-    for (c <- used) {
-      val before = a.text.substring(pos, c.hit.start)
-      line += before.count(_ == '\n')
+    val built = used.foldLeft(Built(0, 1, Vector.empty, Vector.empty)) { (state, c) =>
+      val between = a.text.substring(state.pos, c.hit.start)
+      val line = state.line + between.count(_ == '\n')
       val after = c.rule.replacement(c.hit, c.rule.defn.id, book)
-      out.append(before).append(after)
-      changes += Change(line, c.rule.defn.id, c.hit.text, after)
-      line += c.hit.text.count(_ == '\n')
-      pos = c.hit.end
+      Built(
+        pos = c.hit.end,
+        line = line + c.hit.text.count(_ == '\n'),
+        parts = state.parts :+ between :+ after,
+        changes = state.changes :+ Change(line, c.rule.defn.id, c.hit.text, after))
     }
-    out.append(a.text.substring(pos))
-    (out.toString, changes.toList)
+    (built.parts.mkString + a.text.substring(built.pos), built.changes.toList)
   }
 
   def lineOf(text: String, pos: Int): Int = text.substring(0, pos).count(_ == '\n') + 1
@@ -83,130 +84,186 @@ object Engine {
 // path — полный путь, relative — путь внутри выбранного каталога (для структуры результата)
 case class SourceFile(path: Path, relative: Path)
 
-// skipped — пары (имя, причина)
-case class Scan(files: List[SourceFile], skipped: List[(String, String)])
+// Почему файл пропущен
+sealed trait SkipReason
+case object PathMissing extends SkipReason
+case object UnsupportedExtension extends SkipReason
+
+case class Skipped(name: String, reason: SkipReason)
+
+case class Scan(files: List[SourceFile], skipped: List[Skipped])
 
 object Scanner {
-  def scan(paths: List[Path], recursive: Boolean, cfg: AppConfig): Scan = {
-    val outDir = Paths.get(cfg.outputDirectory).toAbsolutePath.normalize
-    val repDir = Paths.get(cfg.reportDirectory).toAbsolutePath.normalize
-    val files = mutable.ListBuffer[SourceFile]()
-    val skipped = mutable.ListBuffer[(String, String)]()
+  // Найденная запись: существующий файл или несуществующий путь
+  private sealed trait Entry
+  private case class Present(file: Path, relative: Path) extends Entry
+  private case class Absent(name: String) extends Entry
 
-    def consider(file: Path, relative: Path): Unit = {
-      val abs = file.toAbsolutePath.normalize
-      val name = file.getFileName.toString.toLowerCase
-      if (abs.startsWith(outDir) || abs.startsWith(repDir)) {
-        () // свои результаты не обрабатываем
-      } else if (!cfg.supportedExtensions.exists(e => name.endsWith(e.toLowerCase))) {
-        skipped += ((relative.toString, "неподдерживаемое расширение"))
-      } else {
-        files += SourceFile(abs, relative)
-      }
-    }
+  def scan(paths: List[Path], recursive: Boolean, cfg: AppConfig): Either[AppError, Scan] = {
+    val outDir = Workspace.resolve(cfg.outputDirectory)
+    val repDir = Workspace.resolve(cfg.reportDirectory)
 
-    for (p <- paths) {
+    def folderOf(p: Path): Path = {
       val abs = p.toAbsolutePath.normalize
-      val folder = if (Files.isDirectory(p)) abs else abs.getParent
-      if (folder == outDir) throw new ConfigException("Выходной каталог совпадает с исходным")
-      if (!Files.exists(p)) {
-        skipped += ((p.toString, "файл или каталог не найден"))
-      } else if (Files.isDirectory(p)) {
-        val stream = if (recursive) Files.walk(p) else Files.list(p)
-        try {
-          stream.iterator.asScala.filter(f => Files.isRegularFile(f)).foreach(f => consider(f, p.relativize(f)))
-        } finally {
-          stream.close()
-        }
-      } else {
-        consider(p, p.getFileName)
-      }
+      if (Files.isDirectory(p)) abs else Option(abs.getParent).getOrElse(abs)
     }
 
-    Scan(files.toList.distinctBy(_.path).sortBy(_.path.toString), skipped.toList)
+    def expand(p: Path): Either[AppError, List[Entry]] =
+      if (!Files.exists(p)) Right(List(Absent(p.toString)))
+      else if (Files.isDirectory(p)) listFiles(p, recursive).map(files => files.map(f => Present(f, p.relativize(f))))
+      else Right(List(Present(p, Option(p.getFileName).getOrElse(p))))
+
+    // None — файл в папке результата или отчётов: свои результаты не обрабатываем
+    def classify(entry: Entry): Option[Either[Skipped, SourceFile]] = entry match {
+      case Absent(name) => Some(Left(Skipped(name, PathMissing)))
+      case Present(file, relative) =>
+        val abs = file.toAbsolutePath.normalize
+        val name = Option(file.getFileName).map(_.toString.toLowerCase).getOrElse("")
+        if (abs.startsWith(outDir) || abs.startsWith(repDir)) None
+        else if (!cfg.supportedExtensions.exists(ext => name.endsWith(ext.toLowerCase)))
+          Some(Left(Skipped(relative.toString, UnsupportedExtension)))
+        else Some(Right(SourceFile(abs, relative)))
+    }
+
+    if (paths.exists(p => folderOf(p) == outDir)) {
+      Left(OutputEqualsSource)
+    } else {
+      Eithers.traverse(paths)(p => expand(p)).map { entries =>
+        val (skipped, files) = entries.flatten.flatMap(e => classify(e)).partitionMap(e => e)
+        Scan(files.distinctBy(_.path).sortBy(_.path.toString), skipped)
+      }
+    }
   }
+
+  private def listFiles(dir: Path, recursive: Boolean): Either[AppError, List[Path]] =
+    Safe {
+      val stream = if (recursive) Files.walk(dir) else Files.list(dir)
+      try stream.iterator.asScala.filter(f => Files.isRegularFile(f)).toList
+      finally stream.close()
+    } {
+      case _: java.io.IOException => FileIoError
+    }
 }
 
 // ===== Чтение, анализ и запись файлов =====
 
-// Результат анализа одного файла. stamp — (время изменения, размер) для контроля изменений.
-case class FileOutcome(
-    source: SourceFile,
-    analysis: Option[TextAnalysis],
-    error: Option[String],
-    stamp: (Long, Long))
+// Время изменения и размер: по ним видно, что файл изменился во время обработки
+case class FileStamp(modified: Long, size: Long)
+
+case class FileAnalysis(analysis: TextAnalysis, stamp: FileStamp)
+
+// Результат анализа одного файла: либо анализ, либо причина неудачи
+case class FileOutcome(source: SourceFile, analysis: Either[AppError, FileAnalysis])
+
+case class FileFailure(file: String, error: AppError)
 
 case class Report(
     policy: String,
     included: List[String],
-    overrides: List[String],
+    overrides: List[RuleOverride],
     started: LocalDateTime,
     finished: LocalDateTime,
     processed: Int,
     skipped: Int,
     replacements: List[(String, Int)], // (id правила, количество замен)
     conflicts: Int,
-    errors: List[(String, String)],    // (файл, причина)
+    errors: List[FileFailure],
+    kept: List[String],                // файлы, которые не перезаписаны по решению пользователя
     outputDir: String) {
-
   def complete: Boolean = errors.isEmpty
-
-  def toText: String = {
-    val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-    val lines = mutable.ListBuffer[String]()
-    lines += (if (complete) "Обработка завершена." else "Обработка завершена, РЕЗУЛЬТАТ НЕПОЛНЫЙ.")
-    lines += s"Политика: $policy"
-    lines += s"Включённые политики: ${included.mkString(", ")}"
-    overrides.foreach(o => lines += s"Переопределение: $o")
-    lines += s"Начало: ${started.format(fmt)}"
-    lines += s"Завершение: ${finished.format(fmt)}"
-    lines += s"Обработано файлов: $processed"
-    lines += s"Пропущено файлов: $skipped"
-    lines += s"Создано замен: ${replacements.map(_._2).sum}"
-    replacements.foreach { case (id, n) => lines += s"  правило $id: $n" }
-    lines += s"Конфликтов: $conflicts"
-    lines += s"Ошибок: ${errors.size}"
-    errors.foreach { case (file, why) => lines += s"  $file: $why" }
-    lines += "Результат сохранён:"
-    lines += outputDir
-    lines.mkString("\n")
-  }
 }
+
+// Что делать с уже существующими результатами (решение принимает пользователь, не предметная область)
+sealed trait OverwritePolicy
+case object Overwrite extends OverwritePolicy
+case object KeepExisting extends OverwritePolicy
+
+// Итог записи одного файла
+sealed trait WriteResult
+case class Written(changes: List[Change]) extends WriteResult
+case object KeptExisting extends WriteResult
 
 object Processor {
 
-  private def stampOf(p: Path): (Long, Long) = (Files.getLastModifiedTime(p).toMillis, Files.size(p))
+  private def stampOf(p: Path): Either[AppError, FileStamp] =
+    Safe(FileStamp(Files.getLastModifiedTime(p).toMillis, Files.size(p))) {
+      case _: java.io.IOException => FileIoError
+    }
 
-  // Понятная причина ошибки без технических деталей и без содержимого файлов
-  def describe(e: Throwable): String = e match {
-    case _: CharacterCodingException => "файл содержит данные в неподдерживаемой кодировке"
-    case c: ConfigException => c.getMessage
-    case _: java.io.IOException => "ошибка чтения или записи файла"
-    case _ => "внутренняя ошибка"
-  }
-
-  // Строгое чтение UTF-8: неверные байты вызывают ошибку, а не молча портятся
-  private def readUtf8(path: Path): String = {
-    val decoder = StandardCharsets.UTF_8.newDecoder()
-      .onMalformedInput(CodingErrorAction.REPORT)
-      .onUnmappableCharacter(CodingErrorAction.REPORT)
-    decoder.decode(ByteBuffer.wrap(Files.readAllBytes(path))).toString
-  }
+  // Строгое чтение UTF-8: неверные байты дают ошибку, а не молча портятся
+  private def readUtf8(path: Path): Either[AppError, String] =
+    Safe {
+      val decoder = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      decoder.decode(ByteBuffer.wrap(Files.readAllBytes(path))).toString
+    } {
+      case _: CharacterCodingException => UnsupportedEncoding
+      case _: java.io.IOException => FileIoError
+    }
 
   // Анализ всех файлов. Ошибка одного файла не останавливает остальные.
   def analyzeAll(scan: Scan, rules: List[Rule]): List[FileOutcome] =
     scan.files.map { f =>
-      val result = Try {
-        val stamp = stampOf(f.path)
-        (stamp, Engine.analyze(readUtf8(f.path), rules))
-      }
-      result match {
-        case Success((stamp, analysis)) => FileOutcome(f, Some(analysis), None, stamp)
-        case Failure(e) =>
-          Log.error(s"Ошибка чтения файла '${f.relative}'")
-          FileOutcome(f, None, Some(describe(e)), (0L, 0L))
-      }
+      FileOutcome(
+        f,
+        for {
+          stamp <- stampOf(f.path)
+          text <- readUtf8(f.path)
+        } yield FileAnalysis(Engine.analyze(text, rules), stamp))
     }
+
+  // Куда будет записана копия исходного файла
+  private def targetOf(source: SourceFile, outDir: Path, cfg: AppConfig): Path =
+    outDir.resolve(
+      if (cfg.preserveDirectoryStructure) source.relative
+      else Option(source.relative.getFileName).getOrElse(source.relative))
+
+  // Имена исходных файлов, для которых результат уже существует. По этому списку интерфейс
+  // решает, нужно ли спрашивать пользователя о перезаписи. Сама функция ничего не спрашивает.
+  def existingTargets(outcomes: List[FileOutcome], cfg: AppConfig): List[String] = {
+    val outDir = Workspace.resolve(cfg.outputDirectory)
+    outcomes
+      .filter(o => o.analysis.isRight)
+      .filter(o => Files.exists(targetOf(o.source, outDir, cfg)))
+      .map(o => o.source.relative.toString)
+  }
+
+  // Проверяет, что исходный файл не менялся, и записывает результат
+  private def store(
+      outcome: FileOutcome,
+      file: FileAnalysis,
+      target: Path,
+      rendered: (String, List[Change])): Either[AppError, WriteResult] =
+    for {
+      current <- stampOf(outcome.source.path)
+      _ <- Either.cond(current == file.stamp, (), SourceChanged)
+      _ <- Safe {
+        Option(target.getParent).foreach(d => Files.createDirectories(d))
+        Files.write(target, rendered._1.getBytes(StandardCharsets.UTF_8))
+        ()
+      } {
+        case _: java.io.IOException => FileIoError
+      }
+    } yield Written(rendered._2)
+
+  // Обрабатывает один файл. Замена выполняется всегда (так нумерация псевдонимов не зависит от того,
+  // перезаписан ли файл); существующий результат остаётся нетронутым, если пользователь не разрешил перезапись.
+  private def writeOne(
+      outcome: FileOutcome,
+      outDir: Path,
+      cfg: AppConfig,
+      withDisputed: Boolean,
+      overwrite: OverwritePolicy,
+      book: PseudonymBook): Either[AppError, WriteResult] =
+    for {
+      file <- outcome.analysis
+      rendered = Engine.render(file.analysis, withDisputed, book)
+      target = targetOf(outcome.source, outDir, cfg)
+      result <-
+        if (Files.exists(target) && overwrite == KeepExisting) Right(KeptExisting: WriteResult)
+        else store(outcome, file, target, rendered)
+    } yield result
 
   // Создаёт анонимизированные копии. Исходные файлы не изменяются.
   def writeCopies(
@@ -215,47 +272,68 @@ object Processor {
       scan: Scan,
       outcomes: List[FileOutcome],
       cfg: AppConfig,
-      withDisputed: Boolean): Report = {
+      withDisputed: Boolean,
+      overwrite: OverwritePolicy): Report = {
 
     val started = LocalDateTime.now()
-    val outDir = Paths.get(cfg.outputDirectory).toAbsolutePath.normalize
+    val outDir = Workspace.resolve(cfg.outputDirectory)
     val book = new PseudonymBook // один набор псевдонимов на всю операцию
-    val counts = mutable.LinkedHashMap[String, Int]()
-    val errors = mutable.ListBuffer[(String, String)]()
-    var processed = 0
-    var conflicts = 0
 
-    for (o <- outcomes) {
-      val name = o.source.relative.toString
-      o.analysis match {
-        case None =>
-          errors += ((name, o.error.getOrElse("ошибка чтения")))
-        case Some(a) =>
-          conflicts += a.disputed.size
-          val written = Try {
-            val (text, changes) = Engine.render(a, withDisputed, book)
-            val rel = if (cfg.preserveDirectoryStructure) o.source.relative else o.source.relative.getFileName
-            val target = outDir.resolve(rel)
-            if (Files.exists(target) && !cfg.overwriteExistingFiles)
-              throw new ConfigException("выходной файл уже существует")
-            if (stampOf(o.source.path) != o.stamp)
-              throw new ConfigException("исходный файл изменился во время обработки")
-            Files.createDirectories(target.getParent)
-            Files.write(target, text.getBytes(StandardCharsets.UTF_8))
-            changes
-          }
-          written match {
-            case Success(changes) =>
-              processed += 1
-              changes.foreach(c => counts(c.ruleId) = counts.getOrElse(c.ruleId, 0) + 1)
-            case Failure(e) =>
-              Log.error(s"Ошибка обработки файла '$name'")
-              errors += ((name, describe(e)))
-          }
-      }
+    // List.map выполняется по порядку, поэтому нумерация псевдонимов повторяема
+    val results = outcomes.map(o => (o, writeOne(o, outDir, cfg, withDisputed, overwrite, book)))
+
+    val changes = results.flatMap { case (_, result) =>
+      result.toOption.collect { case Written(done) => done }
+    }.flatten
+    val ruleIds = changes.map(_.ruleId).distinct
+    val failures = results.flatMap { case (o, result) =>
+      result.left.toOption.map(error => FileFailure(o.source.relative.toString, error))
     }
+    val kept = results.collect { case (o, Right(KeptExisting)) => o.source.relative.toString }
+    val conflicts = outcomes.flatMap(o => o.analysis.toOption).map(_.analysis.disputed.size).sum
 
-    Report(policy, resolved.policies, resolved.overrides, started, LocalDateTime.now(),
-      processed, scan.skipped.size, counts.toList, conflicts, errors.toList, outDir.toString)
+    Report(
+      policy = policy,
+      included = resolved.policies,
+      overrides = resolved.overrides,
+      started = started,
+      finished = LocalDateTime.now(),
+      processed = results.count { case (_, result) => result.exists(r => r != KeptExisting) },
+      skipped = scan.skipped.size,
+      replacements = ruleIds.map(id => id -> changes.count(_.ruleId == id)),
+      conflicts = conflicts,
+      errors = failures,
+      kept = kept,
+      outputDir = outDir.toString)
+  }
+}
+
+// ===== Подготовка операции (общая для preview и anonymize) =====
+
+case class Prepared(
+    policy: String,
+    resolved: ResolvedPolicy,
+    rules: List[Rule],
+    scan: Scan,
+    outcomes: List[FileOutcome],
+    paths: List[Path],
+    key: String) // политика + пути + режим: по ключу узнаём, выполнялся ли preview
+
+object Anonymization {
+  // Цепочка шагов: каждый может завершиться ошибкой, первая ошибка прекращает цепочку.
+  def prepare(cfg: AppConfig, request: ScanRequest, selection: Selection): Either[AppError, Prepared] = {
+    val (paths, recursive) =
+      if (request.paths.nonEmpty) (request.paths, request.recursive)
+      else (selection.paths, selection.recursive)
+    for {
+      _ <- PolicyOps.find(cfg, request.policy)
+      _ <- Validator.ensureValid(request.policy, cfg)
+      resolved <- PolicyResolver.resolve(request.policy, cfg.policies)
+      rules <- Eithers.traverse(resolved.rules.filter(_.enabled))(r => Rule.from(r))
+      _ <- Either.cond(paths.nonEmpty, (), NoPathsSelected)
+      scan <- Scanner.scan(paths, recursive, cfg)
+      outcomes = Processor.analyzeAll(scan, rules)
+    } yield Prepared(request.policy, resolved, rules, scan, outcomes, paths,
+      s"${request.policy}|${paths.mkString(",")}|$recursive")
   }
 }

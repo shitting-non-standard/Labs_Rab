@@ -1,29 +1,94 @@
-// ===== Модель данных =====
-// Здесь только описание структур. Логики нет и не будет.
+// ===== Модель данных (ADT) =====
+// Здесь только описание структур и разбор их из "сырых" значений. Ввода-вывода нет.
 
 import scala.collection.immutable.ListMap
 
-// Ошибка конфигурации или политики. Текст сообщения безопасен для показа и для журнала.
-class ConfigException(message: String) extends Exception(message)
+// ---------- Виды способов поиска и замены (то, что пользователь выбирает по имени) ----------
 
-// Способ поиска: exact | regex | dictionary | builtin
-case class MatcherSpec(kind: String, value: String)
+enum MatcherKind(val key: String) {
+  case Exact extends MatcherKind("exact")
+  case Regex extends MatcherKind("regex")
+  case Dictionary extends MatcherKind("dictionary")
+  case Builtin extends MatcherKind("builtin")
+}
 
-// Способ замены: constant | remove | mask | pseudonym | list
-// Option = "значение может быть не указано" (это ошибка, которую найдёт проверка)
-case class ReplacementSpec(
-    kind: String,
-    value: Option[String] = None,    // constant: строка замены (можно использовать $1, $2 ...)
-    template: Option[String] = None, // pseudonym: шаблон, например user{number}@example.com
-    values: List[String] = Nil,      // list: значения для подстановки
-    keepStart: Int = 0,              // mask: сколько символов оставить в начале
-    keepEnd: Int = 0                 // mask: сколько символов оставить в конце
-)
+object MatcherKind {
+  def parse(text: String): Either[AppError, MatcherKind] =
+    values.find(k => k.key == text).toRight(UnknownMatcherKind(text))
+
+  def keys: String = values.map(_.key).mkString("/")
+}
+
+enum ReplacementKind(val key: String) {
+  case Constant extends ReplacementKind("constant")
+  case Remove extends ReplacementKind("remove")
+  case Mask extends ReplacementKind("mask")
+  case Pseudonym extends ReplacementKind("pseudonym")
+  case Values extends ReplacementKind("list")
+}
+
+object ReplacementKind {
+  def parse(text: String): Either[AppError, ReplacementKind] =
+    values.find(k => k.key == text).toRight(UnknownReplacementKind(text))
+
+  def keys: String = values.map(_.key).mkString("/")
+}
+
+// ---------- Способ поиска ----------
+sealed trait MatcherSpec
+case class ExactSpec(value: String) extends MatcherSpec
+case class RegexSpec(pattern: String) extends MatcherSpec
+case class DictionarySpec(path: String) extends MatcherSpec
+case class BuiltinSpec(builtin: BuiltinType) extends MatcherSpec
+
+object MatcherSpec {
+  // Из вида и значения. Сопоставление по виду исчерпывающее: неизвестного вида здесь быть не может.
+  def parse(kind: MatcherKind, value: String): Either[AppError, MatcherSpec] = kind match {
+    case MatcherKind.Exact => Either.cond(value.nonEmpty, ExactSpec(value), EmptyExactValue)
+    case MatcherKind.Regex => Either.cond(value.nonEmpty, RegexSpec(value), EmptyRegexValue)
+    case MatcherKind.Dictionary => Right(DictionarySpec(value))
+    case MatcherKind.Builtin =>
+      BuiltinType.byKey(value)
+        .map(b => BuiltinSpec(b))
+        .toRight(UnknownBuiltinType(value, BuiltinType.keys))
+  }
+}
+
+// ---------- Способ замены ----------
+sealed trait ReplacementSpec
+case class ConstantSpec(value: String) extends ReplacementSpec
+case object RemoveSpec extends ReplacementSpec
+case class MaskSpec(keepStart: Int, keepEnd: Int) extends ReplacementSpec
+case class PseudonymSpec(template: String) extends ReplacementSpec
+case class ListSpec(values: List[String]) extends ReplacementSpec // список не пустой
+
+object ReplacementSpec {
+  // Необязательные поля приходят как Option: отсутствие значения становится ошибкой, а не пустой строкой
+  def parse(
+      kind: ReplacementKind,
+      value: Option[String],
+      template: Option[String],
+      values: List[String],
+      keepStart: Int,
+      keepEnd: Int): Either[AppError, ReplacementSpec] = kind match {
+    case ReplacementKind.Constant => value.map(v => ConstantSpec(v)).toRight(ConstantValueMissing)
+    case ReplacementKind.Remove => Right(RemoveSpec)
+    case ReplacementKind.Mask =>
+      Either.cond(keepStart >= 0 && keepEnd >= 0, MaskSpec(keepStart, keepEnd), NegativeKeepCount)
+    case ReplacementKind.Pseudonym =>
+      template
+        .toRight(PseudonymTemplateMissing)
+        .flatMap(t => Either.cond(t.contains("{number}"), PseudonymSpec(t), PseudonymTemplateWithoutNumber))
+    case ReplacementKind.Values => Either.cond(values.nonEmpty, ListSpec(values), ListValuesMissing)
+  }
+}
+
+// ---------- Правила, политики, конфигурация ----------
 
 // Правило анонимизации (как оно записано в конфигурации)
 case class RuleDef(
     id: String,
-    description: String,
+    description: Option[String], // None — описания нет
     matcher: MatcherSpec,
     replacement: ReplacementSpec,
     priority: Int,
@@ -31,7 +96,7 @@ case class RuleDef(
 )
 
 // Политика: ссылки на другие политики (includes) + собственные правила
-case class Policy(description: String, includes: List[String], rules: List[RuleDef])
+case class Policy(description: Option[String], includes: List[String], rules: List[RuleDef])
 
 // Вся конфигурация приложения
 case class AppConfig(

@@ -1,9 +1,9 @@
 // ===== Паттерны Strategy и Factory =====
 // Strategy: способ поиска (Matcher) и способ замены (Replacement) — взаимозаменяемые объекты.
-// Factory:  MatcherFactory и ReplacementFactory создают нужный объект по настройкам из конфигурации.
+// Factory:  MatcherFactory и ReplacementFactory создают нужный объект по ADT-описанию (MatcherSpec, ReplacementSpec).
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Paths}
+import java.nio.file.Files
 import java.util.regex.{Pattern, PatternSyntaxException}
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
@@ -23,66 +23,73 @@ trait Matcher {
 class RegexMatcher(pattern: Pattern) extends Matcher {
   def find(text: String): List[Hit] = {
     val m = pattern.matcher(text)
-    val result = mutable.ListBuffer[Hit]()
-    while (m.find()) {
-      if (m.end() > m.start()) { // пустые совпадения не нужны
-        val groups = (1 to m.groupCount()).map(i => Option(m.group(i)).getOrElse("")).toList
-        result += Hit(m.start(), m.end(), m.group(), groups)
+    // Итератор вызывает find() и сразу читает найденное совпадение; пустые совпадения пропускаются
+    Iterator.continually(m)
+      .takeWhile(x => x.find())
+      .filter(x => x.end() > x.start())
+      .map { x =>
+        val groups = (1 to x.groupCount()).map(i => Option(x.group(i)).getOrElse("")).toList
+        Hit(x.start(), x.end(), x.group(), groups)
       }
-    }
-    result.toList
+      .toList
   }
 }
 
-// Встроенные типы данных. Группа (...) нужна, чтобы сохранить имя поля: "password=" остаётся, значение заменяется.
-object BuiltinPatterns {
-  val all: Map[String, String] = Map(
-    "email" -> """[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}""",
-    "phone" -> """(?U)(?<![\w.])(?:\+7|8|\+\d{1,3})[ \-]?\(?\d{3}\)?[ \-]?\d{3}[ \-]?\d{2}[ \-]?\d{2}(?!\w)""",
-    "ipv4" -> """(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\.?\d)""",
-    "url" -> """(?i)\b(?:https?://|www\.)[^\s<>\x22\x27()\[\]]*[^\s<>\x22\x27()\[\].,;:!?]""",
-    // группа 1 = "password=", дальше идёт само значение
-    "password" -> """(?iuU)\b((?:password|passwd|pwd|пароль)[\x22\x27]?[ \t]*[=:][ \t]*[\x22\x27]?)[^\s`\x22\x27,;]+""",
-    // группа 1 = "token=" или "Bearer "; ключи AWS/GitHub находятся без группы
-    "token" -> """(?iuU)(?:\b((?:(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token|token|secret)[\x22\x27]?[ \t]*[=:][ \t]*[\x22\x27]?|Bearer[ \t]+))[A-Za-z0-9\-._~+/=]{6,}|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,})\b)"""
-  )
+// Встроенные типы данных. Каждый тип — значение перечисления: ключ (его пишут в конфигурации),
+// описание и регулярное выражение. Группа (...) в выражении нужна, чтобы сохранить имя поля
+// (например, "password="): заменяется только значение.
+enum BuiltinType(val key: String, val description: String, val regex: String) {
+  case Email extends BuiltinType("email", "Адрес электронной почты",
+    """[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}""")
+  case Phone extends BuiltinType("phone", "Телефонный номер",
+    """(?U)(?<![\w.])(?:\+7|8|\+\d{1,3})[ \-]?\(?\d{3}\)?[ \-]?\d{3}[ \-]?\d{2}[ \-]?\d{2}(?!\w)""")
+  case IPv4 extends BuiltinType("ipv4", "IPv4-адрес",
+    """(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\.?\d)""")
+  case Url extends BuiltinType("url", "Ссылка (URL)",
+    """(?i)\b(?:https?://|www\.)[^\s<>\x22\x27()\[\]]*[^\s<>\x22\x27()\[\].,;:!?]""")
+  // группа 1 = "password=", дальше идёт само значение
+  case Password extends BuiltinType("password", "Пароль в формате поле=значение",
+    """(?iuU)\b((?:password|passwd|pwd|пароль)[\x22\x27]?[ \t]*[=:][ \t]*[\x22\x27]?)[^\s`\x22\x27,;]+""")
+  // группа 1 = "token=" или "Bearer "; ключи AWS и GitHub находятся без группы
+  case Token extends BuiltinType("token", "Токен или ключ доступа",
+    """(?iuU)(?:\b((?:(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token|token|secret)[\x22\x27]?[ \t]*[=:][ \t]*[\x22\x27]?|Bearer[ \t]+))[A-Za-z0-9\-._~+/=]{6,}|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,})\b)""")
+
+  // Выражение компилируется один раз, при первом обращении
+  lazy val pattern: Pattern = Pattern.compile(regex)
 }
 
-// Factory: по описанию из конфигурации создаёт Matcher или сообщает об ошибке
+object BuiltinType {
+  def byKey(key: String): Option[BuiltinType] = values.find(t => t.key == key)
+
+  // Ключи для подсказок: email/phone/ipv4/...
+  def keys: String = values.map(_.key).mkString("/")
+}
+
+// Factory: по ADT-описанию создаёт Matcher. Ошибкой может закончиться только компиляция
+// регулярного выражения и чтение словаря — это возвращается как значение.
 object MatcherFactory {
-  def create(spec: MatcherSpec): Matcher = spec.kind match {
-    case "exact" =>
-      if (spec.value.isEmpty) throw new ConfigException("для способа exact не указано значение")
-      new RegexMatcher(Pattern.compile(Pattern.quote(spec.value)))
-
-    case "regex" =>
-      if (spec.value.isEmpty) throw new ConfigException("для способа regex не указано выражение")
-      try {
-        new RegexMatcher(Pattern.compile(spec.value))
-      } catch {
-        case e: PatternSyntaxException =>
-          throw new ConfigException("регулярное выражение имеет неправильный формат: " + e.getDescription)
+  def create(spec: MatcherSpec): Either[AppError, Matcher] = spec match {
+    case ExactSpec(value) => Right(new RegexMatcher(Pattern.compile(Pattern.quote(value))))
+    case RegexSpec(pattern) =>
+      Safe(new RegexMatcher(Pattern.compile(pattern))) {
+        case e: PatternSyntaxException => InvalidRegex(e.getDescription)
       }
-
-    case "dictionary" => new RegexMatcher(dictionaryPattern(spec.value))
-
-    case "builtin" =>
-      val p = BuiltinPatterns.all.getOrElse(spec.value,
-        throw new ConfigException(s"встроенный тип '${spec.value}' не поддерживается"))
-      new RegexMatcher(Pattern.compile(p))
-
-    case other => throw new ConfigException(s"способ поиска '$other' не поддерживается")
+    case DictionarySpec(path) => dictionaryPattern(path).map(p => new RegexMatcher(p))
+    case BuiltinSpec(builtin) => Right(new RegexMatcher(builtin.pattern))
   }
 
   // Словарь: текстовый файл UTF-8, одно значение в строке; строки с # — комментарии
-  private def dictionaryPattern(file: String): Pattern = {
-    val words =
-      try {
-        Files.readAllLines(Paths.get(file), StandardCharsets.UTF_8).asScala
-          .map(_.trim).filter(w => w.nonEmpty && !w.startsWith("#")).toList
-      } catch {
-        case _: Exception => throw new ConfigException(s"словарь '$file' отсутствует или не читается")
-      }
+  private def dictionaryPattern(file: String): Either[AppError, Pattern] = {
+    val words: Either[AppError, List[String]] = Safe {
+      Files.readAllLines(Workspace.resolve(file), StandardCharsets.UTF_8).asScala
+        .map(_.trim).filter(w => w.nonEmpty && !w.startsWith("#")).toList
+    } {
+      case _: Exception => DictionaryUnreadable(file)
+    }
+    words.map(compileDictionary)
+  }
+
+  private def compileDictionary(words: List[String]): Pattern =
     if (words.isEmpty) {
       Pattern.compile("(?!)") // пустой словарь ничего не находит
     } else {
@@ -92,13 +99,13 @@ object MatcherFactory {
         """(?<![\p{L}\p{N}_])(?:""" + alternatives + """)(?![\p{L}\p{N}_])""",
         Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE)
     }
-  }
 }
 
 // ---------- Псевдонимы ----------
 
 // Запоминает, какой псевдоним выдан какому значению. Живёт одну операцию и затем пропадает,
 // поэтому связь "значение -> псевдоним" после завершения не сохраняется.
+// Единственный изменяемый объект в предметной области: счётчики псевдонимов.
 class PseudonymBook {
   private val known = mutable.Map[(String, String), String]() // (id правила, значение) -> псевдоним
   private val counters = mutable.Map[String, Int]()           // id правила -> сколько выдано
@@ -135,15 +142,11 @@ class Remove extends Replacement {
 class Mask(keepStart: Int, keepEnd: Int) extends Replacement {
   def apply(hit: Hit, ruleId: String, book: PseudonymBook): String = {
     val total = hit.text.count(_.isLetterOrDigit)
-    var seen = 0
-    hit.text.map { c =>
-      if (!c.isLetterOrDigit) {
-        c
-      } else {
-        seen += 1
-        if (seen <= keepStart || seen > total - keepEnd) c else '*'
-      }
-    }
+    // для каждого символа: сколько букв/цифр было до него включительно
+    val seen = hit.text.scanLeft(0)((n, c) => if (c.isLetterOrDigit) n + 1 else n).tail
+    hit.text.zip(seen).map { case (c, n) =>
+      if (!c.isLetterOrDigit || n <= keepStart || n > total - keepEnd) c else '*'
+    }.mkString
   }
 }
 
@@ -163,26 +166,15 @@ class FromList(values: List[String]) extends Replacement {
     }
 }
 
-// Factory для способов замены
+// Factory для способов замены. Все параметры уже проверены при создании ReplacementSpec,
+// поэтому функция полная и ошибок не возвращает.
 object ReplacementFactory {
-  private def need[T](option: Option[T], message: String): T =
-    option.getOrElse(throw new ConfigException(message))
-
-  def create(spec: ReplacementSpec): Replacement = spec.kind match {
-    case "constant" => new Constant(need(spec.value, "для замены constant не указано значение (value)"))
-    case "remove" => new Remove
-    case "mask" =>
-      if (spec.keepStart < 0 || spec.keepEnd < 0)
-        throw new ConfigException("keepStart и keepEnd не могут быть отрицательными")
-      new Mask(spec.keepStart, spec.keepEnd)
-    case "pseudonym" =>
-      val template = need(spec.template, "для замены pseudonym не указан шаблон (template)")
-      if (!template.contains("{number}")) throw new ConfigException("шаблон pseudonym должен содержать {number}")
-      new Pseudonym(template)
-    case "list" =>
-      if (spec.values.isEmpty) throw new ConfigException("для замены list не указан список значений (values)")
-      new FromList(spec.values)
-    case other => throw new ConfigException(s"способ замены '$other' не поддерживается")
+  def create(spec: ReplacementSpec): Replacement = spec match {
+    case ConstantSpec(value) => new Constant(value)
+    case RemoveSpec => new Remove
+    case MaskSpec(keepStart, keepEnd) => new Mask(keepStart, keepEnd)
+    case PseudonymSpec(template) => new Pseudonym(template)
+    case ListSpec(values) => new FromList(values)
   }
 }
 
@@ -191,7 +183,9 @@ object ReplacementFactory {
 class Rule(val defn: RuleDef, val matcher: Matcher, val replacement: Replacement)
 
 object Rule {
-  // Бросает ConfigException, если в правиле есть ошибка
-  def from(d: RuleDef): Rule =
-    new Rule(d, MatcherFactory.create(d.matcher), ReplacementFactory.create(d.replacement))
+  // Ошибка, найденная при сборке, помечается идентификатором правила
+  def from(d: RuleDef): Either[AppError, Rule] =
+    MatcherFactory.create(d.matcher)
+      .map(m => new Rule(d, m, ReplacementFactory.create(d.replacement)))
+      .left.map(cause => InvalidRule(d.id, cause))
 }
